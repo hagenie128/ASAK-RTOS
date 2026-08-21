@@ -68,7 +68,15 @@ static int connect_server(const http_server_t *server) {
         struct timeval timeout = {.tv_sec = 5, .tv_usec = 0};
         (void) setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
         (void) setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-        if (connect(fd, address->ai_addr, address->ai_addrlen) == 0) break;
+        /*
+         * FreeRTOS tick 신호가 connect()를 EINTR로 깨울 수 있습니다.
+         * 연결이 실패한 것이 아니므로 같은 주소로 다시 시도합니다.
+         */
+        int connected = -1;
+        do {
+            connected = connect(fd, address->ai_addr, address->ai_addrlen);
+        } while (connected < 0 && errno == EINTR);
+        if (connected == 0) break;
         close(fd);
         fd = -1;
     }

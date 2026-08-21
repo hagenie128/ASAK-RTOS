@@ -82,7 +82,7 @@ git push -u origin main
 | Spring polling | pending 조회와 WorkerTask 생성 관찰 | COMPLETED 전체 흐름 재검증 필요 |
 | 영수증 | 콘솔 ASCII 출력 | 실제 프린터 드라이버 없음 |
 | QEMU/ARM | 없음 | 별도 qemu-first-sample 단계 |
-| 통신 오류 | FAILED 결과 PATCH 관찰 | Interrupted system call 재시도 미구현 |
+| 통신 오류 | connect EINTR 재시도 반영 | timeout/재시도 정책은 추가 확정 필요 |
 
 ## 현재 데이터 흐름
 
@@ -120,13 +120,87 @@ make
 CMakeLists.txt는 FREERTOS_KERNEL_PATH, ~/rtos-kiosk-course/third_party/FreeRTOS-Kernel, ~/FreeRTOS-Kernel 순서로 Kernel을 찾습니다.
 
 Windows의 Spring Boot가 8080으로 실행 중일 때 WSL에서는 아래처럼 실행합니다.
+`localhost:8080`은 WSL 자기 자신을 가리키므로 쓰지 말고, Windows 호스트 IP를 씁니다.
 
 ~~~bash
 HOST_IP=$(ip route show default | awk '/default/ {print $3}')
+echo $HOST_IP
 make run SERVER_URL=http://$HOST_IP:8080
 ~~~
 
+정상 시 `[ASAK-RTOS] polling 시작: http://...:8080` 이후 연결 실패 없이 1초 간격 polling이 이어집니다.
+영수증 이벤트가 오면 `[WorkerTask]` → 콘솔 ASCII 영수증 → `[RTOS -> Spring] ... COMPLETED` 순서로 출력됩니다.
+
+상세 연결 절차는 [docs/rtos-connection-howto.md](docs/rtos-connection-howto.md)를 참고합니다.
+
 QEMU 수업 예제는 이 POSIX 실행과 별개입니다. qemu-system-arm과 gcc-arm-none-eabi는 QEMU 예제를 시작할 때만 설치합니다.
+
+## 트러블슈팅 (영수증이 안 나올 때)
+
+이 프로젝트의 “영수증 출력”은 실제 프린터가 아니라 **RTOS 콘솔 ASCII 출력**입니다.
+아래 세 가지가 모두 맞아야 동작합니다.
+
+1. Windows에서 Spring Boot가 **실제로 기동 중** (8080 listen)
+2. WSL에서 `asak_rtos`가 **호스트 IP**로 polling 중
+3. Kiosk/Admin 또는 PowerShell로 `PRINT_RECEIPT` 이벤트 생성
+
+### `BUILD SUCCESSFUL` ≠ Spring 실행 중
+
+PowerShell에서 `.\gradlew.bat bootRun` 후 바로 프롬프트로 돌아오며 `BUILD SUCCESSFUL`만 보이면,
+Gradle 빌드는 끝났지만 **앱은 기동 실패**한 상태입니다.
+
+성공 시에는 프롬프트로 돌아오지 않고 아래 로그가 남아 있어야 합니다.
+
+~~~text
+Tomcat started on port 8080
+Started AsakBackendApplication
+~~~
+
+WSL에서 연결 확인:
+
+~~~bash
+HOST_IP=$(ip route show default | awk '/default/ {print $3}')
+curl -sS "http://$HOST_IP:8080/api/rtos/device-events/pending"
+~~~
+
+정상 예: `"success":true` 와 `"data":null`(대기 이벤트 없음) 또는 pending 이벤트 JSON.
+
+### Spring Boot Temp 디렉터리 소유권 오류
+
+`Unable to start web server` / `TomcatServletWebServerFactory.getWebServer` 아래에 아래 원인이 있으면
+Tomcat 세션 Temp 폴더 소유권 검사 실패입니다.
+
+~~~text
+Caused by: java.lang.IllegalStateException:
+Existing directory 'C:\Users\...\AppData\Local\Temp\8CA9CEBA...'
+is not owned by BUILTIN\Administrators
+~~~
+
+PowerShell에서 Temp 폴더를 지운 뒤 다시 실행합니다.
+
+~~~powershell
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Temp\8CA9CEBA6BC534A234D27F80C99DBB5CB0C0A16C" -ErrorAction SilentlyContinue
+cd C:\ASAK-workspace\ASAK-back
+.\gradlew.bat bootRun --no-daemon
+~~~
+
+재발을 줄이려면 `ASAK-back`의 `application.properties`에 다음을 둡니다.
+
+~~~properties
+server.servlet.session.persistent=false
+~~~
+
+### RTOS 쪽 `Interrupted system call`
+
+FreeRTOS tick이 `connect()`를 `EINTR`로 깨울 수 있습니다.
+`src/http_client.c`는 이 경우 재시도하도록 반영되어 있습니다.
+오래된 바이너리를 쓰는 중이면 `make`로 다시 빌드한 뒤 `make run` 하세요.
+
+### 포트/방화벽
+
+- Windows: `netstat -ano | findstr :8080` 으로 LISTENING 확인
+- WSL → Windows 8080이 타임아웃이면 Windows 방화벽 인바운드(8080) 확인
+- 이미 떠 있는 Spring을 두고 `bootRun`을 또 실행하면 포트 충돌이 날 수 있음
 
 ## 파일과 코드 위치별 의미
 
@@ -164,7 +238,7 @@ QEMU 수업 예제는 이 POSIX 실행과 별개입니다. qemu-system-arm과 gc
 
 - 이벤트 타입: PRINT_RECEIPT 공통 enum과 Kiosk/Admin 요청값
 - payload: pipe 문자열 유지 또는 JSON DTO 전환
-- 통신: EINTR, connect timeout, 재시도와 중복 requestId 정책
+- 통신: connect timeout, 재시도와 중복 requestId 정책 (EINTR 재시도는 http_client에 반영됨)
 - 장치: 실제 프린터 SDK/GPIO/USB/네트워크 출력 방식
 - 운영: RTOS 인증, DB 이벤트 이력, 재시작 복구
 
