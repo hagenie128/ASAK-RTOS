@@ -1,38 +1,24 @@
-/*
-CommandPollTask
-  1. GET /api/rtos/device-events/pending
-  2. 응답 data에서 eventId, eventType, payload 읽기
-  3. PRINT_RECEIPT면 WorkerTask 생성
-
-  
-  {
-    "success": true,
-    "data": {
-      "eventId": 1,
-      "eventType": "PRINT_RECEIPT",
-      "payload": "ORDER-A1035|아메리카노 x 2|9000",
-      "status": "PROCESSING"
-      }
-      }
-      
-      WorkerTask
-        1. payload를 주문번호/메뉴/금액으로 분리
-        2. 콘솔에 영수증 모양 출력
-        3. PATCH /api/rtos/device-events/{eventId}/finish
-        4. status=COMPLETED, result=출력 결과 전송
-+--------------------------------------+
-|            KIOSK RECEIPT             |
-+--------------------------------------+
-  주문 번호 : ORDER-A1035
-  주문 상세 : 아메리카노 x 2
-  결제 금액 : 9000원
-+--------------------------------------+
-
-{
-  "status": "COMPLETED",
-  "result": "receipt printed: ORDER-A1035"
-}
-  */
+/**
+ * CommandPollTask
+ *
+ * 1. GET /api/rtos/device-events/pending
+ * 2. 응답 data에서 eventId, eventType, payload 읽기
+ * 3. PENDING 이벤트가 있으면 WorkerTask 생성
+ *
+ * WorkerTask
+ *
+ * PRINT_RECEIPT
+ * - payload: 주문번호|메뉴요약|금액
+ * - "|" 기준으로 분리한 뒤 기존 영수증 형식으로 출력
+ *
+ * PRINT_RECEIPT_TEXT
+ * - payload: 이미 완성된 영수증 텍스트
+ * - 줄바꿈/옵션/제외/결제정보 등을 포함한 payload를 그대로 출력
+ *
+ * 처리 후
+ * PATCH /api/rtos/device-events/{eventId}/finish
+ * status=COMPLETED 또는 FAILED 결과 보고
+ */
 
 #include "http_client.h"
 #include "FreeRTOS.h"
@@ -46,13 +32,16 @@ CommandPollTask
 #include <stdlib.h>
 #include <string.h>
 
-#define RESPONSE_CAPACITY 2048
+#define RESPONSE_CAPACITY 4096
 #define RESULT_CAPACITY 256
+#define PAYLOAD_CAPACITY 2048
+#define WORKER_TASK_STACK_SIZE 4096
+#define POLL_TASK_STACK_SIZE 4096
 
 typedef struct {
     uint32_t event_id;
     char event_type[32];
-    char payload[256];
+    char payload[PAYLOAD_CAPACITY];
 } work_t;
 
 static http_server_t spring_server;
@@ -67,22 +56,91 @@ static const char *json_value(const char *json, const char *key) {
     return value == NULL ? NULL : value + strlen(pattern);
 }
 
-static int json_string(const char *json, const char *key, char *out, size_t size) {
+static int json_string(
+    const char *json,
+    const char *key,
+    char *out,
+    size_t size
+) {
     const char *value = json_value(json, key);
 
-    if (value == NULL || *value++ != '"') {
+    if (value == NULL) {
         return -1;
     }
 
+    /* ':' 뒤 공백 허용 */
+    while (*value == ' ' || *value == '\t' ||
+           *value == '\r' || *value == '\n') {
+        value++;
+    }
+
+    if (*value != '"') {
+        return -1;
+    }
+
+    value++;
+
     size_t index = 0;
 
-    while (*value && *value != '"' && index + 1 < size) {
+    while (*value != '\0' && index + 1 < size) {
+
+        /* JSON 문자열 종료 */
+        if (*value == '"') {
+            out[index] = '\0';
+            return 0;
+        }
+
+        /* JSON escape 처리 */
+        if (*value == '\\') {
+
+            value++;
+
+            if (*value == '\0') {
+                break;
+            }
+
+            switch (*value) {
+
+                case 'n':
+                    out[index++] = '\n';
+                    break;
+
+                case 'r':
+                    out[index++] = '\r';
+                    break;
+
+                case 't':
+                    out[index++] = '\t';
+                    break;
+
+                case '"':
+                    out[index++] = '"';
+                    break;
+
+                case '\\':
+                    out[index++] = '\\';
+                    break;
+
+                case '/':
+                    out[index++] = '/';
+                    break;
+
+                default:
+                    /* 최소 구현: 알 수 없는 escape는 문자 자체 복사 */
+                    out[index++] = *value;
+                    break;
+            }
+
+            value++;
+            continue;
+        }
+
         out[index++] = *value++;
     }
 
     out[index] = '\0';
 
-    return *value == '"' ? 0 : -1;
+    return -1;
 }
 
 /*
@@ -125,7 +183,7 @@ static int handle_print_receipt(
     char *result,
     size_t result_size
 ) {
-    char payload[sizeof(work->payload)];
+    static char payload[PAYLOAD_CAPACITY];
 
     snprintf(payload, sizeof(payload), "%s", work->payload);
 
@@ -153,6 +211,24 @@ static int handle_print_receipt(
     return 0;
 }
 
+static int handle_print_receipt_text(
+    const work_t *work,
+    char *result,
+    size_t result_size
+) {
+    printf("\n%s\n\n", work->payload);
+
+    vTaskDelay(pdMS_TO_TICKS(1200));
+
+    snprintf(
+        result,
+        result_size,
+        "receipt text printed"
+    );
+
+    return 0;
+}
+
 static void report_result(
     const work_t *work,
     const char *status,
@@ -160,7 +236,7 @@ static void report_result(
 ) {
     char path[128];
     char json[512];
-    char response_body[RESPONSE_CAPACITY];
+    static char response_body[RESPONSE_CAPACITY];
     http_response_t response = {0};
 
     snprintf(
@@ -206,28 +282,62 @@ static void report_result(
 }
 
 static void worker_task(void *parameter) {
-    work_t work = *(work_t *)parameter;
 
-    vPortFree(parameter);
+    work_t *work = (work_t *)parameter;
 
     char result[RESULT_CAPACITY] = {0};
 
     printf(
         "[WorkerTask] eventId=%u, eventType=%s\n",
-        work.event_id,
-        work.event_type
+        work->event_id,
+        work->event_type
     );
 
-    if (strcmp(work.event_type, "PRINT_RECEIPT") == 0) {
-        if (handle_print_receipt(&work, result, sizeof(result)) == 0) {
-            report_result(&work, "COMPLETED", result);
+    if (strcmp(work->event_type, "PRINT_RECEIPT") == 0) {
+
+        if (handle_print_receipt(
+                work,
+                result,
+                sizeof(result)
+            ) == 0) {
+
+            report_result(work, "COMPLETED", result);
+
         } else {
-            report_result(&work, "FAILED", result);
+
+            report_result(work, "FAILED", result);
         }
+
+    } else if (
+        strcmp(work->event_type, "PRINT_RECEIPT_TEXT") == 0
+    ) {
+
+        if (handle_print_receipt_text(
+                work,
+                result,
+                sizeof(result)
+            ) == 0) {
+
+            report_result(work, "COMPLETED", result);
+
+        } else {
+
+            report_result(work, "FAILED", result);
+        }
+
     } else {
-        snprintf(result, sizeof(result), "unsupported eventType: %s", work.event_type);
-        report_result(&work, "FAILED", result);
+
+        snprintf(
+            result,
+            sizeof(result),
+            "unsupported eventType: %s",
+            work->event_type
+        );
+
+        report_result(work, "FAILED", result);
     }
+
+    vPortFree(work);
 
     worker_running = pdFALSE;
 
@@ -235,13 +345,19 @@ static void worker_task(void *parameter) {
 }
 
 static void command_poll_task(void *parameter) {
+
     (void)parameter;
 
+    static char body[RESPONSE_CAPACITY];
+    static work_t parsed;
+
     for (;;) {
+
         if (!worker_running) {
-            char body[RESPONSE_CAPACITY];
+
+            memset(&parsed, 0, sizeof(parsed));
+
             http_response_t response = {0};
-            work_t parsed = {0};
 
             int request_ok = http_request(
                 &spring_server,
@@ -266,13 +382,13 @@ static void command_poll_task(void *parameter) {
 
                     if (
                         xTaskCreate(
-                            worker_task,
-                            "WorkerTask",
-                            2048,
-                            work,
-                            3,
-                            NULL
-                        ) != pdPASS
+    worker_task,
+    "WorkerTask",
+    WORKER_TASK_STACK_SIZE,
+    work,
+    3,
+    NULL
+) != pdPASS
                     ) {
                         worker_running = pdFALSE;
                         vPortFree(work);
@@ -301,7 +417,7 @@ int main(int argc, char **argv) {
         xTaskCreate(
             command_poll_task,
             "CommandPollTask",
-            2048,
+            POLL_TASK_STACK_SIZE,
             NULL,
             2,
             NULL
