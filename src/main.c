@@ -18,6 +18,13 @@
  * 처리 후
  * PATCH /api/rtos/device-events/{eventId}/finish
  * status=COMPLETED 또는 FAILED 결과 보고
+ * 
+ * 
+ * ---------<영수증 출력 유형>---------
+ * 
+ * handle_print_receipt - 간단 내용 출력
+ * handle_print_receipt_text - 상세 내용 출력
+ * 
  */
 
 #include "http_client.h"
